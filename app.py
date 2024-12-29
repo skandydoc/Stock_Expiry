@@ -42,26 +42,30 @@ def parse_expiry_date(date_str):
         # Remove any separators and convert to uppercase
         date_str = re.sub(r'[/\-\.,\s]', ' ', date_str.upper().strip())
         
-        # Common date patterns
+        # Common date patterns with year handling
         patterns = [
             # MON-YY
-            (r'([A-Z]{3})\s*(\d{2})', '%b %y'),
+            (r'([A-Z]{3})\s*(\d{2})', lambda m: (m.group(1), '20' + m.group(2))),
             # MON-YYYY
-            (r'([A-Z]{3})\s*(\d{4})', '%b %Y'),
+            (r'([A-Z]{3})\s*(\d{4})', lambda m: (m.group(1), m.group(2))),
             # MM-YY
-            (r'(\d{2})\s*(\d{2})', '%m %y'),
+            (r'(\d{2})\s*(\d{2})', lambda m: (datetime.strptime(m.group(1), '%m').strftime('%b'), '20' + m.group(2))),
             # MM-YYYY
-            (r'(\d{2})\s*(\d{4})', '%m %Y')
+            (r'(\d{2})\s*(\d{4})', lambda m: (datetime.strptime(m.group(1), '%m').strftime('%b'), m.group(2)))
         ]
         
-        for pattern, date_format in patterns:
+        for pattern, handler in patterns:
             match = re.match(pattern, date_str)
             if match:
-                # Join the matched groups with space
-                date_str = ' '.join(match.groups())
-                # Parse the date
-                date_obj = datetime.strptime(date_str, date_format)
-                # Set day to last day of month for better expiry tracking
+                month, year = handler(match)
+                # Validate year is reasonable (between 2020 and 2040)
+                year_int = int(year)
+                if not (2020 <= year_int <= 2040):
+                    raise ValueError(f"Year {year_int} is out of reasonable range")
+                    
+                date_str = f"{month} {year}"
+                date_obj = datetime.strptime(date_str, '%b %Y')
+                # Set to last day of month
                 next_month = date_obj.replace(day=28) + pd.DateOffset(months=1)
                 last_day = (next_month - pd.DateOffset(days=1)).day
                 date_obj = date_obj.replace(day=last_day)
@@ -88,17 +92,16 @@ def process_image(image):
         Focus on finding expiry dates (not manufacturing dates) and accurate locations of brand names.
 
         For each unique medicine brand visible in the image:
-        1. Identify the brand name and its exact location in pixels
+        1. Identify the brand name and its EXACT location in pixels (look for the brand name text only)
         2. Count the number of strips/packages
         3. Note the quantity per strip/package (e.g., 10 tablets, 15 tablets, etc.)
-        4. Find the expiry date (look for "EXP", "Expiry", or date after MFG/Mfg date)
+        4. Find the expiry date (specifically look for "EXP", "Expiry", or date after MFG/Mfg date)
 
         Return the information in this JSON format:
         {
             "items": [
                 {
                     "brand_name": "Name of the medicine",
-                    "package_type": "strip/syrup/other",
                     "total_packages": number of strips or bottles,
                     "quantity_per_package": number of tablets per strip or volume for syrup,
                     "expiry_date": "found expiry date string",
@@ -109,8 +112,9 @@ def process_image(image):
 
         Important:
         - Look for EXPIRY dates only, not manufacturing dates
-        - Ensure bounding box coordinates are accurate for brand name text
-        - Count partial strips and estimate remaining tablets
+        - For bounding boxes, only mark the exact brand name text location
+        - Ensure coordinates are pixel-accurate for the brand name text
+        - Count all strips of the same medicine together
         - Report dates exactly as seen on package
         - Double-check all coordinates before returning
         """
@@ -133,7 +137,7 @@ def process_image(image):
         for item in data['items']:
             if 'bounding_box' in item:
                 x1, y1, x2, y2 = item['bounding_box']
-                if not (0 <= x1 < x2 and 0 <= y1 < y2):
+                if not (0 <= x1 < x2 and 0 <= y1 < y2) or (x2 - x1) > image.width or (y2 - y1) > image.height:
                     item['bounding_box'] = None
                     st.warning(f"Invalid bounding box for {item['brand_name']}")
         
@@ -174,9 +178,7 @@ def create_monthly_summary(data):
             total_qty = item.get('total_packages', 0) * item.get('quantity_per_package', 0)
             records.append({
                 'Brand Name': item['brand_name'],
-                'Package Type': item.get('package_type', 'N/A'),
                 'Total Packages': item.get('total_packages', 0),
-                'Qty per Package': item.get('quantity_per_package', 0),
                 'Total Quantity': total_qty,
                 'Expiry Date': expiry_date
             })
@@ -190,7 +192,6 @@ def create_monthly_summary(data):
     
     # Group by Month-Year and Brand Name
     summary = df.groupby(['Month-Year', 'Brand Name']).agg({
-        'Package Type': 'first',
         'Total Packages': 'sum',
         'Total Quantity': 'sum'
     }).reset_index()
@@ -235,7 +236,6 @@ if uploaded_files:
                 st.write("Extracted Information")
                 df = pd.DataFrame([{
                     'Brand Name': item['brand_name'],
-                    'Package Type': item.get('package_type', 'N/A'),
                     'Total Packages': item.get('total_packages', 0),
                     'Qty per Package': item.get('quantity_per_package', 0),
                     'Total Quantity': item.get('total_packages', 0) * item.get('quantity_per_package', 0),
@@ -259,7 +259,6 @@ if uploaded_files:
                     if idx < len(processed_data['items']):
                         processed_data['items'][idx].update({
                             'brand_name': row['Brand Name'],
-                            'package_type': row['Package Type'],
                             'total_packages': row['Total Packages'],
                             'quantity_per_package': row['Qty per Package'],
                             'expiry_date': row['Expiry Date']
