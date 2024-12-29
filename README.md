@@ -8,7 +8,7 @@ This project is licensed under the Creative Commons Attribution-NonCommercial-Sh
 
 # Pharmacy Inventory Scanner
 
-A Streamlit application that uses Google's Gemini 1.5 flash Vision model to scan and process pharmacy inventory images, extracting drug information and expiry dates.
+A Proof of concept - Streamlit application that uses Google's Gemini 1.5 flash Vision model to scan and process pharmacy inventory images, extracting drug information and expiry dates - accuracy optimisation is not complete - but a reasonably good level of accuracy and basic context is depicted.
 
 ## Features
 
