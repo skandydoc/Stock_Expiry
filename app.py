@@ -11,9 +11,6 @@ import json
 from ratelimit import limits, sleep_and_retry
 import base64
 
-# Disable usage stats
-st.set_option('browser.gatherUsageStats', False)
-
 # Load environment variables
 load_dotenv()
 

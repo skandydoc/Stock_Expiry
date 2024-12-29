@@ -1,6 +1,14 @@
+## License
+
+This project is licensed under the Creative Commons Attribution-NonCommercial-ShareAlike 4.0 International License. You can view the full license [here](https://creativecommons.org/licenses/by-nc-sa/4.0/).
+
+
+![CC BY-NC-SA 4.0](https://i.creativecommons.org/l/by-nc-sa/4.0/88x31.png)
+
+
 # Pharmacy Inventory Scanner
 
-A Streamlit application that uses Google's Gemini 1.5 Pro Vision model to scan and process pharmacy inventory images, extracting drug information and expiry dates.
+A Streamlit application that uses Google's Gemini 1.5 flash Vision model to scan and process pharmacy inventory images, extracting drug information and expiry dates.
 
 ## Features
 
@@ -56,7 +64,7 @@ streamlit run app.py
 ## Requirements
 
 - Python 3.8+
-- Google API key with access to Gemini Pro Vision model
+- Google API key with access to Gemini 1.5 flash Vision model
 - Required Python packages (see requirements.txt)
 
 ## Note
