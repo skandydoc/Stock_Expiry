@@ -155,21 +155,25 @@ def process_image(image):
 
         prompt = """
         Analyze this pharmacy inventory image ({width}x{height} pixels) and extract information about all visible medicine packages.
-        Pay special attention to text positioning and dates.
+        Pay special attention to distinguishing between brand names and generic names.
 
-        For each unique medicine brand visible in the image:
-        1. Find the brand name text and its location
+        For each unique medicine visible in the image:
+        1. Find both:
+           - Brand/Trade name (e.g., Allegra-M, Pantosec)
+           - Generic name (chemical name of the drug)
         2. Count all strips/packages of this medicine
         3. Note the quantity per strip (usually 10, 15, 20, or 30 tablets)
         4. Find dates, distinguishing between:
            - Manufacturing Date (MFG/Mfg Date)
            - Expiry Date (EXP/Expiry Date)
+        5. Find the exact location of the brand name text in the image
 
         Return a valid JSON object in this exact format:
         {{
             "items": [
                 {{
-                    "brand_name": "Exact brand name as shown",
+                    "brand_name": "Brand/Trade name of the medicine",
+                    "generic_name": "Generic/Chemical name of the drug",
                     "total_packages": number of strips (count partial strips as 1),
                     "quantity_per_package": number of tablets per strip (10/15/20/30),
                     "mfg_date": "manufacturing date exactly as shown",
@@ -180,6 +184,8 @@ def process_image(image):
         }}
 
         Important:
+        - Brand name should be the trade name of the drug (NOT the manufacturer name like Cipla/Leeford)
+        - Generic name should be the chemical/scientific name of the drug
         - Return coordinates in normalized format (0-1000 range)
         - Coordinates should be in [ymin, xmin, ymax, xmax] format
         - Brand name bounding box should tightly frame only the brand name text
@@ -195,7 +201,6 @@ def process_image(image):
             
         # Clean and parse JSON response
         json_str = response.text.strip()
-        # Remove any markdown code block syntax
         json_str = re.sub(r'^```json\s*', '', json_str, flags=re.MULTILINE)
         json_str = re.sub(r'\s*```$', '', json_str, flags=re.MULTILINE)
         json_str = json_str.strip()
@@ -204,32 +209,45 @@ def process_image(image):
             data = json.loads(json_str)
         except json.JSONDecodeError as e:
             st.error(f"Invalid JSON response: {str(e)}")
-            st.code(json_str, language='json')  # Display the problematic JSON
+            st.code(json_str, language='json')
             return None
             
         if not isinstance(data, dict) or 'items' not in data or not isinstance(data['items'], list):
             st.error("Invalid response format: missing 'items' array")
             return None
         
-        # Validate and normalize bounding boxes
+        # Validate and normalize data
         for item in data['items']:
             if not isinstance(item, dict):
                 continue
                 
             # Ensure required fields exist
-            item['brand_name'] = str(item.get('brand_name', ''))
+            item['brand_name'] = str(item.get('brand_name', '')).strip()
+            item['generic_name'] = str(item.get('generic_name', '')).strip()
             item['total_packages'] = int(item.get('total_packages', 0))
             item['quantity_per_package'] = int(item.get('quantity_per_package', 0))
-            item['expiry_date'] = str(item.get('expiry_date', ''))
             
             # Validate bounding box
             if 'bounding_box' in item:
-                validated_box = validate_coordinates(item['bounding_box'], original_width, original_height)
-                if validated_box:
-                    item['bounding_box'] = validated_box
-                else:
+                box = item['bounding_box']
+                if not isinstance(box, list) or len(box) != 4:
                     item['bounding_box'] = None
-                    st.warning(f"Invalid bounding box for {item['brand_name']}")
+                    continue
+                    
+                try:
+                    # Ensure coordinates are within 0-1000 range
+                    ymin, xmin, ymax, xmax = map(float, box)
+                    if not all(0 <= coord <= 1000 for coord in [ymin, xmin, ymax, xmax]):
+                        item['bounding_box'] = None
+                        continue
+                        
+                    if ymin >= ymax or xmin >= xmax:
+                        item['bounding_box'] = None
+                        continue
+                        
+                    item['bounding_box'] = [int(ymin), int(xmin), int(ymax), int(xmax)]
+                except:
+                    item['bounding_box'] = None
             
             # Validate quantity
             try:
@@ -238,12 +256,6 @@ def process_image(image):
                     st.warning(f"Unusual quantity per package for {item['brand_name']}: {qty}")
             except:
                 item['quantity_per_package'] = 0
-            
-            # Validate dates
-            if 'mfg_date' in item:
-                item['mfg_date'] = str(item.get('mfg_date', ''))
-            if 'expiry_date' in item:
-                item['expiry_date'] = str(item.get('expiry_date', ''))
         
         return data
     except Exception as e:
@@ -336,6 +348,7 @@ def create_monthly_summary(data):
             total_qty = item.get('total_packages', 0) * item.get('quantity_per_package', 0)
             records.append({
                 'Brand Name': item['brand_name'],
+                'Generic Name': item.get('generic_name', ''),
                 'Total Packages': item.get('total_packages', 0),
                 'Total Quantity': total_qty,
                 'Expiry Date': expiry_date
@@ -349,7 +362,7 @@ def create_monthly_summary(data):
     df['Month-Year'] = df['Expiry Date'].dt.strftime('%Y-%m')
     
     # Group by Month-Year and Brand Name
-    summary = df.groupby(['Month-Year', 'Brand Name']).agg({
+    summary = df.groupby(['Month-Year', 'Brand Name', 'Generic Name']).agg({
         'Total Packages': 'sum',
         'Total Quantity': 'sum'
     }).reset_index()
@@ -394,6 +407,7 @@ if uploaded_files:
                 st.write("Extracted Information")
                 df = pd.DataFrame([{
                     'Brand Name': item['brand_name'],
+                    'Generic Name': item.get('generic_name', ''),
                     'Total Packages': item.get('total_packages', 0),
                     'Qty per Package': item.get('quantity_per_package', 0),
                     'Total Quantity': item.get('total_packages', 0) * item.get('quantity_per_package', 0),
@@ -408,7 +422,15 @@ if uploaded_files:
                     df,
                     use_container_width=True,
                     num_rows="fixed",
-                    hide_index=False
+                    hide_index=False,
+                    column_config={
+                        'Brand Name': st.column_config.TextColumn('Brand Name', width='medium'),
+                        'Generic Name': st.column_config.TextColumn('Generic Name', width='medium'),
+                        'Total Packages': st.column_config.NumberColumn('Total Packages', width='small'),
+                        'Qty per Package': st.column_config.NumberColumn('Qty per Package', width='small'),
+                        'Total Quantity': st.column_config.NumberColumn('Total Quantity', width='small'),
+                        'Expiry Date': st.column_config.TextColumn('Expiry Date', width='medium')
+                    }
                 )
                 
                 # Update processed data with edited values
@@ -417,6 +439,7 @@ if uploaded_files:
                     if idx < len(processed_data['items']):
                         processed_data['items'][idx].update({
                             'brand_name': row['Brand Name'],
+                            'generic_name': row['Generic Name'],
                             'total_packages': row['Total Packages'],
                             'quantity_per_package': row['Qty per Package'],
                             'expiry_date': row['Expiry Date']
