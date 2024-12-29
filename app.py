@@ -25,17 +25,19 @@ if not GOOGLE_API_KEY:
 genai.configure(api_key=GOOGLE_API_KEY)
 model = genai.GenerativeModel('gemini-1.5-flash')
 
-# Load sample image
-@st.cache_data
-def load_sample_image():
+def format_month_year(date_str):
+    """Convert date string to MON YYYY format"""
     try:
-        return Image.open("sample.png")
-    except Exception as e:
-        st.error(f"Error loading sample image: {str(e)}")
-        return None
+        date_obj = datetime.strptime(date_str, '%Y-%m')
+        return date_obj.strftime('%b %Y').upper()
+    except:
+        return date_str
 
 def parse_expiry_date(date_str):
     """Parse various expiry date formats and return YYYY-MM-DD"""
+    if not date_str or date_str.lower() in ['none', 'null', '']:
+        return None
+        
     try:
         # Remove any separators and convert to uppercase
         date_str = re.sub(r'[/\-\.,\s]', ' ', date_str.upper().strip())
@@ -67,20 +69,8 @@ def parse_expiry_date(date_str):
                 
         raise ValueError(f"Unrecognized date format: {date_str}")
     except Exception as e:
-        st.warning(f"Error parsing date '{date_str}': {str(e)}. Using end of current month.")
-        current_date = datetime.now()
-        return current_date.replace(day=1).strftime('%Y-%m-%d')
-
-def parse_quantity(qty_str):
-    """Parse quantity string to integer"""
-    try:
-        # Extract numbers from string
-        numbers = re.findall(r'\d+', str(qty_str))
-        if numbers:
-            return int(numbers[0])
-        return 0
-    except:
-        return 0
+        st.warning(f"Could not parse date '{date_str}': {str(e)}")
+        return None
 
 @sleep_and_retry
 @limits(calls=14, period=60)
@@ -95,12 +85,13 @@ def process_image(image):
 
         prompt = """
         Analyze this pharmacy inventory image and extract information about all visible medicine packages.
+        Focus on finding expiry dates (not manufacturing dates) and accurate locations of brand names.
+
         For each unique medicine brand visible in the image:
-        1. Identify the brand name
-        2. Find its location in the image
-        3. Count the number of strips/packages
-        4. Note the quantity per strip/package
-        5. Find the expiry date
+        1. Identify the brand name and its exact location in pixels
+        2. Count the number of strips/packages
+        3. Note the quantity per strip/package (e.g., 10 tablets, 15 tablets, etc.)
+        4. Find the expiry date (look for "EXP", "Expiry", or date after MFG/Mfg date)
 
         Return the information in this JSON format:
         {
@@ -110,18 +101,18 @@ def process_image(image):
                     "package_type": "strip/syrup/other",
                     "total_packages": number of strips or bottles,
                     "quantity_per_package": number of tablets per strip or volume for syrup,
-                    "expiry_date": "found date string",
+                    "expiry_date": "found expiry date string",
                     "bounding_box": [x1, y1, x2, y2]
                 }
             ]
         }
 
         Important:
-        - Look for ALL unique medicines in the image
-        - For strips that are cut, estimate remaining quantity
-        - Include partial strips in total_packages count
-        - Report the expiry date exactly as seen, don't modify format
-        - Bounding box should frame the brand name text
+        - Look for EXPIRY dates only, not manufacturing dates
+        - Ensure bounding box coordinates are accurate for brand name text
+        - Count partial strips and estimate remaining tablets
+        - Report dates exactly as seen on package
+        - Double-check all coordinates before returning
         """
         
         response = model.generate_content([prompt, {'mime_type': 'image/png', 'data': img_base64}])
@@ -136,7 +127,17 @@ def process_image(image):
         if json_str.endswith('```'):
             json_str = json_str[:-3]
         
-        return json.loads(json_str.strip())
+        data = json.loads(json_str.strip())
+        
+        # Validate bounding boxes
+        for item in data['items']:
+            if 'bounding_box' in item:
+                x1, y1, x2, y2 = item['bounding_box']
+                if not (0 <= x1 < x2 and 0 <= y1 < y2):
+                    item['bounding_box'] = None
+                    st.warning(f"Invalid bounding box for {item['brand_name']}")
+        
+        return data
     except Exception as e:
         st.error(f"Error processing image: {str(e)}")
         return None
@@ -147,34 +148,38 @@ def draw_bounding_boxes(image, boxes_data):
     img_with_boxes = img_array.copy()
     
     for item in boxes_data['items']:
-        if 'bounding_box' in item:
-            x1, y1, x2, y2 = item['bounding_box']
-            # Draw rectangle around brand name
-            cv2.rectangle(img_with_boxes, (x1, y1), (x2, y2), (0, 255, 0), 2)
-            # Add brand name label
-            cv2.putText(img_with_boxes, item['brand_name'], (x1, y1-10), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+        if 'bounding_box' in item and item['bounding_box']:
+            try:
+                x1, y1, x2, y2 = item['bounding_box']
+                # Draw rectangle around brand name
+                cv2.rectangle(img_with_boxes, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                # Add brand name label above the box
+                label = f"{item['brand_name']}"
+                cv2.putText(img_with_boxes, label, (x1, max(y1-10, 20)), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+            except Exception as e:
+                st.warning(f"Error drawing box for {item['brand_name']}: {str(e)}")
     
     return Image.fromarray(img_with_boxes)
 
 def create_monthly_summary(data):
     """Create monthly summary of expiring drugs"""
-    if not data:
+    if not data or not data.get('items'):
         return pd.DataFrame()
     
     records = []
     for item in data['items']:
-        # Calculate total quantity
-        total_qty = item.get('total_packages', 0) * item.get('quantity_per_package', 0)
-        
-        records.append({
-            'Brand Name': item['brand_name'],
-            'Package Type': item.get('package_type', 'N/A'),
-            'Total Packages': item.get('total_packages', 0),
-            'Qty per Package': item.get('quantity_per_package', 0),
-            'Total Quantity': total_qty,
-            'Expiry Date': parse_expiry_date(item.get('expiry_date', ''))
-        })
+        expiry_date = parse_expiry_date(item.get('expiry_date', ''))
+        if expiry_date:  # Only include items with valid expiry dates
+            total_qty = item.get('total_packages', 0) * item.get('quantity_per_package', 0)
+            records.append({
+                'Brand Name': item['brand_name'],
+                'Package Type': item.get('package_type', 'N/A'),
+                'Total Packages': item.get('total_packages', 0),
+                'Qty per Package': item.get('quantity_per_package', 0),
+                'Total Quantity': total_qty,
+                'Expiry Date': expiry_date
+            })
     
     if not records:
         return pd.DataFrame()
@@ -198,13 +203,12 @@ st.write("Upload images of pharmacy inventory to extract and analyze drug inform
 
 # Add sample image button
 if st.button("Try with Sample Image"):
-    sample_image = load_sample_image()
-    if sample_image:
-        uploaded_files = [io.BytesIO()]
-        sample_image.save(uploaded_files[0], format='PNG')
-        uploaded_files[0].seek(0)
-        uploaded_files[0].name = "sample.png"
-    else:
+    try:
+        with open("image.png", "rb") as f:
+            uploaded_files = [io.BytesIO(f.read())]
+            uploaded_files[0].name = "image.png"
+    except Exception as e:
+        st.error(f"Error loading sample image: {str(e)}")
         uploaded_files = []
 else:
     uploaded_files = st.file_uploader("Choose image files", type=['jpg', 'jpeg', 'png'], accept_multiple_files=True)
@@ -213,58 +217,53 @@ if uploaded_files:
     all_data = []
     
     for uploaded_file in uploaded_files:
-        st.write("---")
-        st.subheader(f"Processing: {uploaded_file.name}")
-        
         try:
             # Process image
             image = Image.open(uploaded_file)
             processed_data = process_image(image)
             
             if processed_data:
-                # Create two columns with adjusted width
-                col1, col2 = st.columns([1, 1.5])
+                st.write("---")
+                st.subheader(f"Processing: {uploaded_file.name}")
                 
                 # Display original image with bounding boxes
-                with col1:
-                    st.write("Input Image with Detections")
-                    annotated_image = draw_bounding_boxes(image, processed_data)
-                    st.image(annotated_image)
+                st.write("Input Image with Detections")
+                annotated_image = draw_bounding_boxes(image, processed_data)
+                st.image(annotated_image)
                 
                 # Display structured data as editable table
-                with col2:
-                    st.write("Extracted Information")
-                    df = pd.DataFrame([{
-                        'Brand Name': item['brand_name'],
-                        'Package Type': item.get('package_type', 'N/A'),
-                        'Total Packages': item.get('total_packages', 0),
-                        'Qty per Package': item.get('quantity_per_package', 0),
-                        'Total Quantity': item.get('total_packages', 0) * item.get('quantity_per_package', 0),
-                        'Expiry Date': item.get('expiry_date', '')
-                    } for item in processed_data['items']])
-                    
-                    # Add index starting from 1
-                    df.index = range(1, len(df) + 1)
-                    
-                    # Display full table without horizontal scroll
-                    edited_df = st.data_editor(
-                        df,
-                        use_container_width=True,
-                        num_rows="fixed",
-                        hide_index=False
-                    )
-                    
-                    # Update processed data with edited values
-                    for i, row in edited_df.iterrows():
-                        idx = i - 1  # Convert 1-based index back to 0-based
-                        if idx < len(processed_data['items']):
-                            processed_data['items'][idx].update({
-                                'brand_name': row['Brand Name'],
-                                'package_type': row['Package Type'],
-                                'total_packages': row['Total Packages'],
-                                'quantity_per_package': row['Qty per Package'],
-                                'expiry_date': row['Expiry Date']
-                            })
+                st.write("Extracted Information")
+                df = pd.DataFrame([{
+                    'Brand Name': item['brand_name'],
+                    'Package Type': item.get('package_type', 'N/A'),
+                    'Total Packages': item.get('total_packages', 0),
+                    'Qty per Package': item.get('quantity_per_package', 0),
+                    'Total Quantity': item.get('total_packages', 0) * item.get('quantity_per_package', 0),
+                    'Expiry Date': item.get('expiry_date', '')
+                } for item in processed_data['items']])
+                
+                # Add index starting from 1
+                df.index = range(1, len(df) + 1)
+                
+                # Display full table without horizontal scroll
+                edited_df = st.data_editor(
+                    df,
+                    use_container_width=True,
+                    num_rows="fixed",
+                    hide_index=False
+                )
+                
+                # Update processed data with edited values
+                for i, row in edited_df.iterrows():
+                    idx = i - 1  # Convert 1-based index back to 0-based
+                    if idx < len(processed_data['items']):
+                        processed_data['items'][idx].update({
+                            'brand_name': row['Brand Name'],
+                            'package_type': row['Package Type'],
+                            'total_packages': row['Total Packages'],
+                            'quantity_per_package': row['Qty per Package'],
+                            'expiry_date': row['Expiry Date']
+                        })
                 
                 all_data.append(processed_data)
         except Exception as e:
@@ -286,7 +285,8 @@ if uploaded_files:
                     month_data = summary_df[summary_df['Month-Year'] == month_year].copy()
                     month_data.index = range(1, len(month_data) + 1)  # Start index from 1
                     
-                    st.write(f"**Expiring in {month_year}**")
+                    formatted_date = format_month_year(month_year)
+                    st.write(f"**Expiring in {formatted_date}**")
                     st.dataframe(
                         month_data.drop('Month-Year', axis=1),
                         use_container_width=True,
