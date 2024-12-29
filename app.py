@@ -8,6 +8,11 @@ import os
 from dotenv import load_dotenv
 import io
 import json
+from ratelimit import limits, sleep_and_retry
+import base64
+
+# Disable usage stats
+st.set_option('browser.gatherUsageStats', False)
 
 # Load environment variables
 load_dotenv()
@@ -19,11 +24,19 @@ if not GOOGLE_API_KEY:
     st.stop()
 
 genai.configure(api_key=GOOGLE_API_KEY)
-model = genai.GenerativeModel('gemini-1.5-pro-vision')
+model = genai.GenerativeModel('gemini-1.5-flash')
 
+@sleep_and_retry
+@limits(calls=14, period=60)
 def process_image(image):
     """Process image with Gemini model and return structured data"""
     try:
+        # Convert PIL Image to bytes
+        img_byte_arr = io.BytesIO()
+        image.save(img_byte_arr, format='PNG')
+        img_byte_arr = img_byte_arr.getvalue()
+        img_base64 = base64.b64encode(img_byte_arr).decode('utf-8')
+
         prompt = """
         Analyze this pharmacy inventory image and extract the following information in JSON format:
         - Drug generic name
@@ -49,8 +62,20 @@ def process_image(image):
             ]
         }
         """
-        response = model.generate_content([prompt, image])
-        return json.loads(response.text)
+        
+        response = model.generate_content([prompt, {'mime_type': 'image/png', 'data': img_base64}])
+        
+        if not response.text:
+            st.warning("Response blocked or empty due to safety concerns")
+            return None
+            
+        json_str = response.text.strip()
+        if json_str.startswith('```json'):
+            json_str = json_str[7:]
+        if json_str.endswith('```'):
+            json_str = json_str[:-3]
+        
+        return json.loads(json_str.strip())
     except Exception as e:
         st.error(f"Error processing image: {str(e)}")
         return None
