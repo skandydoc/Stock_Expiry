@@ -40,37 +40,47 @@ def parse_expiry_date(date_str):
         
     try:
         # Remove any separators and convert to uppercase
-        date_str = re.sub(r'[/\-\.,\s]', ' ', date_str.upper().strip())
+        date_str = re.sub(r'[/\-\.,\s]+', ' ', date_str.upper().strip())
         
-        # Extract date if it's after EXP or EXPIRY
-        exp_match = re.search(r'EXP(?:IRY)?\s*:?\s*([A-Z0-9\s]+)', date_str)
-        if exp_match:
-            date_str = exp_match.group(1).strip()
+        # First try to extract date after EXP/EXPIRY
+        exp_patterns = [
+            r'EXP(?:IRY)?[:\s]+([A-Z0-9\s]+)',
+            r'EXPIRY\s*DATE\s*:?\s*([A-Z0-9\s]+)',
+        ]
+        
+        for pattern in exp_patterns:
+            match = re.search(pattern, date_str)
+            if match:
+                date_str = match.group(1).strip()
+                break
         
         # Common date patterns with year handling
         patterns = [
+            # MM YYYY (direct)
+            (r'^(\d{1,2})\s+(\d{4})$', lambda m: (int(m.group(1)), int(m.group(2)))),
             # MON-YY
-            (r'([A-Z]{3})\s*(\d{2})\b', lambda m: (m.group(1), '20' + m.group(2))),
+            (r'([A-Z]{3})\s*(\d{2})\b', lambda m: (datetime.strptime(m.group(1), '%b').month, 2000 + int(m.group(2)))),
             # MON-YYYY
-            (r'([A-Z]{3})\s*(\d{4})\b', lambda m: (m.group(1), m.group(2))),
+            (r'([A-Z]{3})\s*(\d{4})\b', lambda m: (datetime.strptime(m.group(1), '%b').month, int(m.group(2)))),
             # MM-YY
-            (r'\b(\d{2})\s*(\d{2})\b', lambda m: (datetime.strptime(m.group(1), '%m').strftime('%b'), '20' + m.group(2))),
+            (r'\b(\d{1,2})\s*(\d{2})\b', lambda m: (int(m.group(1)), 2000 + int(m.group(2)))),
             # MM-YYYY
-            (r'\b(\d{2})\s*(\d{4})\b', lambda m: (datetime.strptime(m.group(1), '%m').strftime('%b'), m.group(2)))
+            (r'\b(\d{1,2})\s*(\d{4})\b', lambda m: (int(m.group(1)), int(m.group(2))))
         ]
         
         for pattern, handler in patterns:
             match = re.search(pattern, date_str)
             if match:
-                month, year = handler(match)
-                # Validate year is reasonable (between 2020 and 2040)
-                year_int = int(year)
-                if not (2020 <= year_int <= 2040):
-                    continue  # Try next pattern if year is unreasonable
-                    
                 try:
-                    date_str = f"{month} {year}"
-                    date_obj = datetime.strptime(date_str, '%b %Y')
+                    month, year = handler(match)
+                    # Validate month and year
+                    if not (1 <= month <= 12):
+                        continue
+                    if not (2020 <= year <= 2040):
+                        continue
+                        
+                    # Create date object
+                    date_obj = datetime(year, month, 1)
                     # Set to last day of month
                     next_month = date_obj.replace(day=28) + pd.DateOffset(months=1)
                     last_day = (next_month - pd.DateOffset(days=1)).day
@@ -79,7 +89,7 @@ def parse_expiry_date(date_str):
                 except:
                     continue
                 
-        raise ValueError(f"Unrecognized date format: {date_str}")
+        raise ValueError(f"Could not parse date format: {date_str}")
     except Exception as e:
         st.warning(f"Could not parse date '{date_str}': {str(e)}")
         return None
@@ -99,17 +109,16 @@ def process_image(image):
         img_base64 = base64.b64encode(img_byte_arr).decode('utf-8')
 
         prompt = """
-        Analyze this pharmacy inventory image and extract information about all visible medicine packages.
-        The image dimensions are {width}x{height} pixels.
+        Analyze this pharmacy inventory image ({width}x{height} pixels) and extract information about all visible medicine packages.
+        Pay special attention to text positioning and dates.
 
         For each unique medicine brand visible in the image:
-        1. Identify the brand name and its EXACT pixel coordinates in the image
-        2. Count the number of complete and partial strips/packages
-        3. Look for numbers indicating tablets per strip (usually 10, 15, 20, or 30)
-        4. Find the expiry date by looking for:
-           - Text starting with "EXP" or "Expiry"
-           - Date format after "Mfg." or "Manufacturing Date"
-           - Usually in format MM/YY, MM/YYYY, MON/YY, or MON/YYYY
+        1. Find the EXACT pixel coordinates of the brand name text
+        2. Count all strips/packages of this medicine
+        3. Note the quantity per strip (usually 10, 15, 20, or 30 tablets)
+        4. Find dates, distinguishing between:
+           - Manufacturing Date (MFG/Mfg Date)
+           - Expiry Date (EXP/Expiry Date)
 
         Return a valid JSON object in this exact format:
         {{
@@ -118,19 +127,19 @@ def process_image(image):
                     "brand_name": "Exact brand name as shown",
                     "total_packages": number of strips (count partial strips as 1),
                     "quantity_per_package": number of tablets per strip (10/15/20/30),
-                    "expiry_date": "exact expiry date as shown on package",
+                    "mfg_date": "manufacturing date exactly as shown",
+                    "expiry_date": "expiry date exactly as shown",
                     "bounding_box": [x1, y1, x2, y2]
                 }}
             ]
         }}
 
         Important:
-        - Return ONLY the JSON object, no additional text or formatting
-        - Ensure all numbers are integers
-        - Coordinates must be within image dimensions: 0 ≤ x ≤ {width}, 0 ≤ y ≤ {height}
-        - Only mark the exact brand name text location
-        - Count all strips of the same medicine together
-        - Report the exact date text as seen, don't modify the format
+        - Coordinates must be EXACT pixel positions in the image
+        - Brand name bounding box should tightly frame only the brand name text
+        - All numbers must be integers
+        - Report dates exactly as shown on package
+        - Double-check all coordinates are within image bounds: 0 ≤ x ≤ {width}, 0 ≤ y ≤ {height}
         """.format(width=original_width, height=original_height)
         
         response = model.generate_content([prompt, {'mime_type': 'image/png', 'data': img_base64}])
@@ -168,28 +177,14 @@ def process_image(image):
             item['quantity_per_package'] = int(item.get('quantity_per_package', 0))
             item['expiry_date'] = str(item.get('expiry_date', ''))
             
+            # Validate bounding box
             if 'bounding_box' in item:
-                try:
-                    box = item['bounding_box']
-                    if not isinstance(box, list) or len(box) != 4:
-                        raise ValueError("Invalid box format")
-                        
-                    x1, y1, x2, y2 = map(int, box)
-                    # Ensure coordinates are within image bounds
-                    x1 = max(0, min(x1, original_width))
-                    x2 = max(0, min(x2, original_width))
-                    y1 = max(0, min(y1, original_height))
-                    y2 = max(0, min(y2, original_height))
-                    
-                    # Ensure box has reasonable size
-                    if (x2 - x1) < 10 or (y2 - y1) < 5 or (x2 - x1) > original_width/2:
-                        item['bounding_box'] = None
-                        st.warning(f"Invalid box size for {item['brand_name']}")
-                    else:
-                        item['bounding_box'] = [x1, y1, x2, y2]
-                except Exception as e:
+                validated_box = validate_coordinates(item['bounding_box'], original_width, original_height)
+                if validated_box:
+                    item['bounding_box'] = validated_box
+                else:
                     item['bounding_box'] = None
-                    st.warning(f"Invalid coordinates for {item['brand_name']}: {str(e)}")
+                    st.warning(f"Invalid bounding box for {item['brand_name']}")
             
             # Validate quantity
             try:
@@ -198,6 +193,12 @@ def process_image(image):
                     st.warning(f"Unusual quantity per package for {item['brand_name']}: {qty}")
             except:
                 item['quantity_per_package'] = 0
+            
+            # Validate dates
+            if 'mfg_date' in item:
+                item['mfg_date'] = str(item.get('mfg_date', ''))
+            if 'expiry_date' in item:
+                item['expiry_date'] = str(item.get('expiry_date', ''))
         
         return data
     except Exception as e:
@@ -206,48 +207,105 @@ def process_image(image):
 
 def draw_bounding_boxes(image, boxes_data):
     """Draw bounding boxes on the image"""
+    # Convert to RGB if needed
+    if image.mode != 'RGB':
+        image = image.convert('RGB')
+    
     img_array = np.array(image)
     img_with_boxes = img_array.copy()
     
     # Get image dimensions
     height, width = img_with_boxes.shape[:2]
     
+    # Define colors for different elements
+    colors = {
+        'brand': (0, 255, 0),  # Green for brand names
+        'text': (255, 255, 255)  # White for text background
+    }
+    
     for item in boxes_data['items']:
         if 'bounding_box' in item and item['bounding_box']:
             try:
-                x1, y1, x2, y2 = item['bounding_box']
-                # Ensure coordinates are within bounds
-                x1, x2 = min(max(0, x1), width), min(max(0, x2), width)
-                y1, y2 = min(max(0, y1), height), min(max(0, y2), height)
+                x1, y1, x2, y2 = map(int, item['bounding_box'])
                 
-                # Draw rectangle around brand name
-                cv2.rectangle(img_with_boxes, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                # Validate coordinates
+                if not (0 <= x1 < width and 0 <= y1 < height and 0 <= x2 < width and 0 <= y2 < height):
+                    st.warning(f"Invalid coordinates for {item['brand_name']}: outside image bounds")
+                    continue
                 
-                # Add brand name label above the box
-                label = f"{item['brand_name']}"
+                if x2 <= x1 or y2 <= y1:
+                    st.warning(f"Invalid coordinates for {item['brand_name']}: negative or zero area")
+                    continue
+                
+                # Draw rectangle with slightly thicker lines for visibility
+                cv2.rectangle(img_with_boxes, (x1, y1), (x2, y2), colors['brand'], 2)
+                
+                # Prepare label text
+                label = item['brand_name']
+                
                 # Calculate text size and position
-                font_scale = 0.6
-                thickness = 2
                 font = cv2.FONT_HERSHEY_SIMPLEX
-                (text_width, text_height), _ = cv2.getTextSize(label, font, font_scale, thickness)
+                font_scale = 0.5
+                thickness = 1
+                (text_width, text_height), baseline = cv2.getTextSize(label, font, font_scale, thickness)
                 
-                # Ensure label is visible
-                text_x = x1
-                text_y = max(text_height + 5, y1 - 5)
+                # Position text above the box if possible, below if not enough space
+                if y1 > text_height + 10:
+                    text_y = y1 - 5
+                else:
+                    text_y = y2 + text_height + 5
                 
-                # Draw white background for text
-                cv2.rectangle(img_with_boxes, 
-                            (text_x, text_y - text_height - 5),
-                            (text_x + text_width, text_y + 5),
-                            (255, 255, 255), -1)
-                            
-                cv2.putText(img_with_boxes, label, (text_x, text_y),
-                           font, font_scale, (0, 255, 0), thickness)
-                           
+                # Create background for text
+                padding = 2
+                bg_pts = np.array([
+                    [x1, text_y - text_height - padding],
+                    [x1 + text_width + 2*padding, text_y - text_height - padding],
+                    [x1 + text_width + 2*padding, text_y + padding],
+                    [x1, text_y + padding]
+                ], np.int32)
+                
+                # Draw semi-transparent background
+                overlay = img_with_boxes.copy()
+                cv2.fillPoly(overlay, [bg_pts], colors['text'])
+                cv2.addWeighted(overlay, 0.7, img_with_boxes, 0.3, 0, img_with_boxes)
+                
+                # Draw text
+                cv2.putText(img_with_boxes, label, (x1 + padding, text_y),
+                           font, font_scale, colors['brand'], thickness)
+                
             except Exception as e:
                 st.warning(f"Error drawing box for {item['brand_name']}: {str(e)}")
     
     return Image.fromarray(img_with_boxes)
+
+def validate_coordinates(box, image_width, image_height, min_size=10):
+    """Validate and normalize bounding box coordinates"""
+    if not isinstance(box, (list, tuple)) or len(box) != 4:
+        return None
+        
+    try:
+        x1, y1, x2, y2 = map(int, box)
+        
+        # Basic bounds checking
+        if not (0 <= x1 < image_width and 0 <= y1 < image_height and
+                0 <= x2 <= image_width and 0 <= y2 <= image_height):
+            return None
+            
+        # Ensure correct ordering
+        x1, x2 = min(x1, x2), max(x1, x2)
+        y1, y2 = min(y1, y2), max(y1, y2)
+        
+        # Check minimum size
+        if (x2 - x1) < min_size or (y2 - y1) < min_size:
+            return None
+            
+        # Check maximum size (shouldn't be more than half the image)
+        if (x2 - x1) > image_width/2 or (y2 - y1) > image_height/2:
+            return None
+            
+        return [x1, y1, x2, y2]
+    except:
+        return None
 
 def create_monthly_summary(data):
     """Create monthly summary of expiring drugs"""
