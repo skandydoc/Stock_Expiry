@@ -94,6 +94,51 @@ def parse_expiry_date(date_str):
         st.warning(f"Could not parse date '{date_str}': {str(e)}")
         return None
 
+def normalize_coordinates(box, image_width, image_height):
+    """Convert pixel coordinates to normalized coordinates (0-1000 range)"""
+    x1, y1, x2, y2 = box
+    return [
+        int(y1 * 1000 / image_height),  # ymin
+        int(x1 * 1000 / image_width),   # xmin
+        int(y2 * 1000 / image_height),  # ymax
+        int(x2 * 1000 / image_width)    # xmax
+    ]
+
+def denormalize_coordinates(box, image_width, image_height):
+    """Convert normalized coordinates (0-1000 range) to pixel coordinates"""
+    ymin, xmin, ymax, xmax = box
+    return [
+        int(xmin * image_width / 1000),   # x1
+        int(ymin * image_height / 1000),  # y1
+        int(xmax * image_width / 1000),   # x2
+        int(ymax * image_height / 1000)   # y2
+    ]
+
+def validate_coordinates(box, image_width, image_height, min_size=10):
+    """Validate and normalize bounding box coordinates"""
+    if not isinstance(box, (list, tuple)) or len(box) != 4:
+        return None
+        
+    try:
+        # Convert normalized coordinates to pixel coordinates
+        x1, y1, x2, y2 = denormalize_coordinates(box, image_width, image_height)
+        
+        # Ensure correct ordering
+        x1, x2 = min(x1, x2), max(x1, x2)
+        y1, y2 = min(y1, y2), max(y1, y2)
+        
+        # Check minimum size
+        if (x2 - x1) < min_size or (y2 - y1) < min_size:
+            return None
+            
+        # Check maximum size (shouldn't be more than half the image)
+        if (x2 - x1) > image_width/2 or (y2 - y1) > image_height/2:
+            return None
+            
+        return [x1, y1, x2, y2]
+    except:
+        return None
+
 @sleep_and_retry
 @limits(calls=14, period=60)
 def process_image(image):
@@ -113,7 +158,7 @@ def process_image(image):
         Pay special attention to text positioning and dates.
 
         For each unique medicine brand visible in the image:
-        1. Find the EXACT pixel coordinates of the brand name text
+        1. Find the brand name text and its location
         2. Count all strips/packages of this medicine
         3. Note the quantity per strip (usually 10, 15, 20, or 30 tablets)
         4. Find dates, distinguishing between:
@@ -129,17 +174,17 @@ def process_image(image):
                     "quantity_per_package": number of tablets per strip (10/15/20/30),
                     "mfg_date": "manufacturing date exactly as shown",
                     "expiry_date": "expiry date exactly as shown",
-                    "bounding_box": [x1, y1, x2, y2]
+                    "bounding_box": [ymin, xmin, ymax, xmax]
                 }}
             ]
         }}
 
         Important:
-        - Coordinates must be EXACT pixel positions in the image
+        - Return coordinates in normalized format (0-1000 range)
+        - Coordinates should be in [ymin, xmin, ymax, xmax] format
         - Brand name bounding box should tightly frame only the brand name text
         - All numbers must be integers
         - Report dates exactly as shown on package
-        - Double-check all coordinates are within image bounds: 0 ≤ x ≤ {width}, 0 ≤ y ≤ {height}
         """.format(width=original_width, height=original_height)
         
         response = model.generate_content([prompt, {'mime_type': 'image/png', 'data': img_base64}])
@@ -226,7 +271,8 @@ def draw_bounding_boxes(image, boxes_data):
     for item in boxes_data['items']:
         if 'bounding_box' in item and item['bounding_box']:
             try:
-                x1, y1, x2, y2 = map(int, item['bounding_box'])
+                # Convert normalized coordinates to pixel coordinates
+                x1, y1, x2, y2 = denormalize_coordinates(item['bounding_box'], width, height)
                 
                 # Validate coordinates
                 if not (0 <= x1 < width and 0 <= y1 < height and 0 <= x2 < width and 0 <= y2 < height):
@@ -277,35 +323,6 @@ def draw_bounding_boxes(image, boxes_data):
                 st.warning(f"Error drawing box for {item['brand_name']}: {str(e)}")
     
     return Image.fromarray(img_with_boxes)
-
-def validate_coordinates(box, image_width, image_height, min_size=10):
-    """Validate and normalize bounding box coordinates"""
-    if not isinstance(box, (list, tuple)) or len(box) != 4:
-        return None
-        
-    try:
-        x1, y1, x2, y2 = map(int, box)
-        
-        # Basic bounds checking
-        if not (0 <= x1 < image_width and 0 <= y1 < image_height and
-                0 <= x2 <= image_width and 0 <= y2 <= image_height):
-            return None
-            
-        # Ensure correct ordering
-        x1, x2 = min(x1, x2), max(x1, x2)
-        y1, y2 = min(y1, y2), max(y1, y2)
-        
-        # Check minimum size
-        if (x2 - x1) < min_size or (y2 - y1) < min_size:
-            return None
-            
-        # Check maximum size (shouldn't be more than half the image)
-        if (x2 - x1) > image_width/2 or (y2 - y1) > image_height/2:
-            return None
-            
-        return [x1, y1, x2, y2]
-    except:
-        return None
 
 def create_monthly_summary(data):
     """Create monthly summary of expiring drugs"""
