@@ -25,6 +25,15 @@ if not GOOGLE_API_KEY:
 genai.configure(api_key=GOOGLE_API_KEY)
 model = genai.GenerativeModel('gemini-1.5-flash')
 
+# Load sample image
+@st.cache_data
+def load_sample_image():
+    try:
+        return Image.open("sample.png")
+    except Exception as e:
+        st.error(f"Error loading sample image: {str(e)}")
+        return None
+
 def parse_expiry_date(date_str):
     """Parse various expiry date formats and return YYYY-MM-DD"""
     try:
@@ -187,7 +196,18 @@ def create_monthly_summary(data):
 st.title("Pharmacy Inventory Scanner")
 st.write("Upload images of pharmacy inventory to extract and analyze drug information")
 
-uploaded_files = st.file_uploader("Choose image files", type=['jpg', 'jpeg', 'png'], accept_multiple_files=True)
+# Add sample image button
+if st.button("Try with Sample Image"):
+    sample_image = load_sample_image()
+    if sample_image:
+        uploaded_files = [io.BytesIO()]
+        sample_image.save(uploaded_files[0], format='PNG')
+        uploaded_files[0].seek(0)
+        uploaded_files[0].name = "sample.png"
+    else:
+        uploaded_files = []
+else:
+    uploaded_files = st.file_uploader("Choose image files", type=['jpg', 'jpeg', 'png'], accept_multiple_files=True)
 
 if uploaded_files:
     all_data = []
@@ -196,58 +216,85 @@ if uploaded_files:
         st.write("---")
         st.subheader(f"Processing: {uploaded_file.name}")
         
-        # Create two columns for input and output
-        col1, col2 = st.columns(2)
-        
-        # Process image
-        image = Image.open(uploaded_file)
-        processed_data = process_image(image)
-        
-        if processed_data:
-            # Display original image with bounding boxes
-            with col1:
-                st.write("Input Image with Detections")
-                annotated_image = draw_bounding_boxes(image, processed_data)
-                st.image(annotated_image)
+        try:
+            # Process image
+            image = Image.open(uploaded_file)
+            processed_data = process_image(image)
             
-            # Display structured data as editable table
-            with col2:
-                st.write("Extracted Information")
-                df = pd.DataFrame([{
-                    'Brand Name': item['brand_name'],
-                    'Package Type': item.get('package_type', 'N/A'),
-                    'Total Packages': item.get('total_packages', 0),
-                    'Qty per Package': item.get('quantity_per_package', 0),
-                    'Total Quantity': item.get('total_packages', 0) * item.get('quantity_per_package', 0),
-                    'Expiry Date': item.get('expiry_date', '')
-                } for item in processed_data['items']])
+            if processed_data:
+                # Create two columns with adjusted width
+                col1, col2 = st.columns([1, 1.5])
                 
-                edited_df = st.data_editor(df)
+                # Display original image with bounding boxes
+                with col1:
+                    st.write("Input Image with Detections")
+                    annotated_image = draw_bounding_boxes(image, processed_data)
+                    st.image(annotated_image)
                 
-                # Update processed data with edited values
-                for i, row in edited_df.iterrows():
-                    if i < len(processed_data['items']):
-                        processed_data['items'][i].update({
-                            'brand_name': row['Brand Name'],
-                            'package_type': row['Package Type'],
-                            'total_packages': row['Total Packages'],
-                            'quantity_per_package': row['Qty per Package'],
-                            'expiry_date': row['Expiry Date']
-                        })
-            
-            all_data.append(processed_data)
+                # Display structured data as editable table
+                with col2:
+                    st.write("Extracted Information")
+                    df = pd.DataFrame([{
+                        'Brand Name': item['brand_name'],
+                        'Package Type': item.get('package_type', 'N/A'),
+                        'Total Packages': item.get('total_packages', 0),
+                        'Qty per Package': item.get('quantity_per_package', 0),
+                        'Total Quantity': item.get('total_packages', 0) * item.get('quantity_per_package', 0),
+                        'Expiry Date': item.get('expiry_date', '')
+                    } for item in processed_data['items']])
+                    
+                    # Add index starting from 1
+                    df.index = range(1, len(df) + 1)
+                    
+                    # Display full table without horizontal scroll
+                    edited_df = st.data_editor(
+                        df,
+                        use_container_width=True,
+                        num_rows="fixed",
+                        hide_index=False
+                    )
+                    
+                    # Update processed data with edited values
+                    for i, row in edited_df.iterrows():
+                        idx = i - 1  # Convert 1-based index back to 0-based
+                        if idx < len(processed_data['items']):
+                            processed_data['items'][idx].update({
+                                'brand_name': row['Brand Name'],
+                                'package_type': row['Package Type'],
+                                'total_packages': row['Total Packages'],
+                                'quantity_per_package': row['Qty per Package'],
+                                'expiry_date': row['Expiry Date']
+                            })
+                
+                all_data.append(processed_data)
+        except Exception as e:
+            st.error(f"Error processing {uploaded_file.name}: {str(e)}")
+            continue
     
     if all_data:
         st.write("---")
-        st.subheader("Monthly Expiry Summary")
+        st.subheader("Monthwise Expiry List Summary")
         
-        # Combine all data for summary
-        combined_data = {'items': [item for data in all_data for item in data['items']]}
-        summary_df = create_monthly_summary(combined_data)
-        
-        if not summary_df.empty:
-            st.dataframe(summary_df, use_container_width=True)
-        else:
-            st.write("No data available for summary")
+        try:
+            # Combine all data for summary
+            combined_data = {'items': [item for data in all_data for item in data['items']]}
+            summary_df = create_monthly_summary(combined_data)
+            
+            if not summary_df.empty:
+                # Group by Month-Year and display separate tables
+                for month_year in sorted(summary_df['Month-Year'].unique()):
+                    month_data = summary_df[summary_df['Month-Year'] == month_year].copy()
+                    month_data.index = range(1, len(month_data) + 1)  # Start index from 1
+                    
+                    st.write(f"**Expiring in {month_year}**")
+                    st.dataframe(
+                        month_data.drop('Month-Year', axis=1),
+                        use_container_width=True,
+                        hide_index=False
+                    )
+            else:
+                st.info("No expiry data available for summary")
+        except Exception as e:
+            st.error(f"Error creating summary: {str(e)}")
 else:
     st.info("Please upload some images to begin") 
