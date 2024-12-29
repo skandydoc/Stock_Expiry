@@ -111,20 +111,22 @@ def process_image(image):
            - Date format after "Mfg." or "Manufacturing Date"
            - Usually in format MM/YY, MM/YYYY, MON/YY, or MON/YYYY
 
-        Return the information in this JSON format:
-        {
+        Return a valid JSON object in this exact format:
+        {{
             "items": [
-                {
+                {{
                     "brand_name": "Exact brand name as shown",
                     "total_packages": number of strips (count partial strips as 1),
                     "quantity_per_package": number of tablets per strip (10/15/20/30),
                     "expiry_date": "exact expiry date as shown on package",
-                    "bounding_box": [x1, y1, x2, y2] for brand name text only
-                }
+                    "bounding_box": [x1, y1, x2, y2]
+                }}
             ]
-        }
+        }}
 
         Important:
+        - Return ONLY the JSON object, no additional text or formatting
+        - Ensure all numbers are integers
         - Coordinates must be within image dimensions: 0 ≤ x ≤ {width}, 0 ≤ y ≤ {height}
         - Only mark the exact brand name text location
         - Count all strips of the same medicine together
@@ -137,37 +139,61 @@ def process_image(image):
             st.warning("Response blocked or empty due to safety concerns")
             return None
             
+        # Clean and parse JSON response
         json_str = response.text.strip()
-        if json_str.startswith('```json'):
-            json_str = json_str[7:]
-        if json_str.endswith('```'):
-            json_str = json_str[:-3]
+        # Remove any markdown code block syntax
+        json_str = re.sub(r'^```json\s*', '', json_str, flags=re.MULTILINE)
+        json_str = re.sub(r'\s*```$', '', json_str, flags=re.MULTILINE)
+        json_str = json_str.strip()
         
-        data = json.loads(json_str.strip())
+        try:
+            data = json.loads(json_str)
+        except json.JSONDecodeError as e:
+            st.error(f"Invalid JSON response: {str(e)}")
+            st.code(json_str, language='json')  # Display the problematic JSON
+            return None
+            
+        if not isinstance(data, dict) or 'items' not in data or not isinstance(data['items'], list):
+            st.error("Invalid response format: missing 'items' array")
+            return None
         
         # Validate and normalize bounding boxes
         for item in data['items']:
+            if not isinstance(item, dict):
+                continue
+                
+            # Ensure required fields exist
+            item['brand_name'] = str(item.get('brand_name', ''))
+            item['total_packages'] = int(item.get('total_packages', 0))
+            item['quantity_per_package'] = int(item.get('quantity_per_package', 0))
+            item['expiry_date'] = str(item.get('expiry_date', ''))
+            
             if 'bounding_box' in item:
                 try:
-                    x1, y1, x2, y2 = map(int, item['bounding_box'])
+                    box = item['bounding_box']
+                    if not isinstance(box, list) or len(box) != 4:
+                        raise ValueError("Invalid box format")
+                        
+                    x1, y1, x2, y2 = map(int, box)
                     # Ensure coordinates are within image bounds
                     x1 = max(0, min(x1, original_width))
                     x2 = max(0, min(x2, original_width))
                     y1 = max(0, min(y1, original_height))
                     y2 = max(0, min(y2, original_height))
+                    
                     # Ensure box has reasonable size
                     if (x2 - x1) < 10 or (y2 - y1) < 5 or (x2 - x1) > original_width/2:
                         item['bounding_box'] = None
                         st.warning(f"Invalid box size for {item['brand_name']}")
                     else:
                         item['bounding_box'] = [x1, y1, x2, y2]
-                except:
+                except Exception as e:
                     item['bounding_box'] = None
-                    st.warning(f"Invalid coordinates for {item['brand_name']}")
+                    st.warning(f"Invalid coordinates for {item['brand_name']}: {str(e)}")
             
             # Validate quantity
             try:
-                qty = int(item.get('quantity_per_package', 0))
+                qty = int(item['quantity_per_package'])
                 if qty not in [10, 15, 20, 30]:
                     st.warning(f"Unusual quantity per package for {item['brand_name']}: {qty}")
             except:
